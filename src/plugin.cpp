@@ -16,7 +16,6 @@ static constexpr double DESYNC_THRESHOLD = 0.3;                 // Seconds
 static constexpr double MINIMUM_TIME_STEP = 0.001;              // Seconds
 static constexpr double MINIMUM_PLAY_RATE_STEP = 0.001;         // Seconds
 static constexpr double GUITAR_PRO_CURSOR_JUMP_THRESHOLD = 0.1; // Seconds
-static constexpr double LATENCY_COMPENSATION = 0.05;           // Seconds
 
 struct Plugin::Impl final {
     Impl(PluginState& plugin_state)
@@ -127,14 +126,14 @@ private:
             // If the guitar pro cursor has jumped, follow the jump
             if (!this->CompareDoubles(m_prev_guitar_pro_state.play_position, m_guitar_pro_state.play_position, GUITAR_PRO_CURSOR_JUMP_THRESHOLD))
             {
-                this->SetPlayPosition(m_guitar_pro_state.play_position + LATENCY_COMPENSATION);
+                this->SetPlayPosition(m_guitar_pro_state.play_position + m_reaper.GetOutputLatency());
             }
 
             // If a desync occurs for any other reason, get it back in sync
             // Guitar Pro can be a bit inconsistent so this needs to be checked over the course of a few loops though to ensure accuracy
             else if (this->Desync(DESYNC_THRESHOLD))
             {
-                this->SetPlayPosition(m_guitar_pro_state.play_position + LATENCY_COMPENSATION);
+                this->SetPlayPosition(m_guitar_pro_state.play_position + m_reaper.GetOutputLatency());
             }
         }
     }
@@ -182,12 +181,12 @@ private:
                 // If a loop is specified start there
                 if (m_guitar_pro_state.time_selection_start_position > MINIMUM_TIME_STEP)
                 {
-                    this->SetPlayPosition(m_guitar_pro_state.time_selection_start_position + LATENCY_COMPENSATION);
+                    this->SetPlayPosition(m_guitar_pro_state.time_selection_start_position + m_reaper.GetOutputLatency());
                 }
 
                 else
                 {
-                    this->SetPlayPosition(m_guitar_pro_state.play_position + LATENCY_COMPENSATION);
+                    this->SetPlayPosition(m_guitar_pro_state.play_position + m_reaper.GetOutputLatency());
                 }
 
                 m_reaper.SetPlayState(ReaperPlayState::PLAYING);
