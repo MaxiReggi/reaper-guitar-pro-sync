@@ -4,18 +4,21 @@
 #include "reaper.h"
 
 #include <array>
+#include <chrono>
 #include <memory>
 #include <stdexcept>
 
 namespace tnt {
 
-// REAPER runs this periodically 30 times/second so a desync window of 9 is approximately 300ms
-static constexpr int DESYNC_WINDOW_SIZE = 9;
+// REAPER runs this periodically 30 times/second so a desync window of 3 is approximately 100ms
+static constexpr int DESYNC_WINDOW_SIZE = 3;
 
-static constexpr double DESYNC_THRESHOLD = 0.3;                 // Seconds
+static constexpr double DESYNC_THRESHOLD = 0.06;                // Seconds
 static constexpr double MINIMUM_TIME_STEP = 0.001;              // Seconds
 static constexpr double MINIMUM_PLAY_RATE_STEP = 0.001;         // Seconds
 static constexpr double GUITAR_PRO_CURSOR_JUMP_THRESHOLD = 0.1; // Seconds
+// Cap dead reckoning extrapolation to avoid runaway drift between Guitar Pro updates.
+static constexpr double DEAD_RECKONING_MAX_EXTRAPOLATION = 0.2; // Seconds
 
 struct Plugin::Impl final {
     Impl(PluginState& plugin_state)
@@ -45,7 +48,9 @@ struct Plugin::Impl final {
             m_reaper.ShowConsoleMessage("Successfully connected to Guitar Pro process.\n");
             m_last_error = "";
         }
-        
+
+        this->UpdateDeadReckoning();
+
         // Ensure REAPER stays in sync while Guitar Pro is playing
         if (m_guitar_pro_state.play_state)
         {
@@ -93,6 +98,31 @@ struct Plugin::Impl final {
     }
 
 private:
+    // Dead reckoning: track the last Guitar Pro position update and extrapolate forward
+    // using elapsed real time x play rate. This gives a smooth real-time estimate of
+    // Guitar Pro's current position between its ~15 Hz memory updates, allowing a much
+    // tighter DESYNC_THRESHOLD without triggering false corrections from stale data.
+    void UpdateDeadReckoning()
+    {
+        if (!this->CompareDoubles(m_guitar_pro_state.play_position, m_gp_reckoned_position, MINIMUM_TIME_STEP))
+        {
+            m_gp_reckoned_position = m_guitar_pro_state.play_position;
+            m_gp_reckoned_time = std::chrono::steady_clock::now();
+            m_gp_reckoning_valid = true;
+        }
+    }
+
+    double GetDeadReckonedPosition() const
+    {
+        if (!m_gp_reckoning_valid || !m_guitar_pro_state.play_state)
+            return m_guitar_pro_state.play_position;
+
+        const double elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - m_gp_reckoned_time).count();
+        const double capped = elapsed < DEAD_RECKONING_MAX_EXTRAPOLATION ? elapsed : DEAD_RECKONING_MAX_EXTRAPOLATION;
+        return m_gp_reckoned_position + capped * m_guitar_pro_state.play_rate;
+    }
+
     void SyncLoopState()
     {
         // Sync the loop state (unless we are playing and there is a count in timer)
@@ -114,7 +144,9 @@ private:
 
     void SyncPlayPosition()
     {
-        if (this->GuitarProCursorMoved() && !CompareDoubles(m_reaper.GetPlayPosition(), m_guitar_pro_state.play_position, DESYNC_THRESHOLD))
+        const double gp_pos = this->GetDeadReckonedPosition();
+
+        if (!this->CompareDoubles(m_reaper.GetPlayPosition(), gp_pos, DESYNC_THRESHOLD))
         {
             // DO NOT SYNC if REAPER is right at the start or end of the loop
             if (this->CompareDoubles(m_reaper.GetPlayPosition(), m_guitar_pro_state.time_selection_start_position, DESYNC_THRESHOLD)
@@ -126,14 +158,13 @@ private:
             // If the guitar pro cursor has jumped, follow the jump
             if (!this->CompareDoubles(m_prev_guitar_pro_state.play_position, m_guitar_pro_state.play_position, GUITAR_PRO_CURSOR_JUMP_THRESHOLD))
             {
-                this->SetPlayPosition(m_guitar_pro_state.play_position + m_reaper.GetOutputLatency());
+                this->SetPlayPosition(gp_pos + m_reaper.GetOutputLatency());
             }
 
             // If a desync occurs for any other reason, get it back in sync
-            // Guitar Pro can be a bit inconsistent so this needs to be checked over the course of a few loops though to ensure accuracy
-            else if (this->Desync(DESYNC_THRESHOLD))
+            else if (this->Desync(DESYNC_THRESHOLD, gp_pos))
             {
-                this->SetPlayPosition(m_guitar_pro_state.play_position + m_reaper.GetOutputLatency());
+                this->SetPlayPosition(gp_pos + m_reaper.GetOutputLatency());
             }
         }
     }
@@ -209,10 +240,10 @@ private:
         }
     }
 
-    bool Desync(const double threshold)
+    bool Desync(const double threshold, const double reference_position)
     {
         std::rotate(m_desync_window.rbegin(), m_desync_window.rbegin() + 1, m_desync_window.rend());
-        m_desync_window[0] = fabs(m_reaper.GetPlayPosition() - m_guitar_pro_state.play_position);
+        m_desync_window[0] = fabs(m_reaper.GetPlayPosition() - reference_position);
 
         // Return false if ANY value in the window is not greater than the threshold
         for (const double value : m_desync_window)
@@ -226,7 +257,7 @@ private:
         // Desync has definitively occurred
         return true;
     }
-    
+
     void SetPlayPosition(const double time)
     {
         m_reaper.SetEditCursorPosition(time, false, true);
@@ -294,6 +325,10 @@ private:
 
     // Keeps track of the last error (prevents spamming the log with errors)
     std::string m_last_error = "";
+
+    double m_gp_reckoned_position = 0.0;
+    std::chrono::steady_clock::time_point m_gp_reckoned_time;
+    bool m_gp_reckoning_valid = false;
 };
 
 Plugin::Plugin(PluginState& plugin_state)
