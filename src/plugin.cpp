@@ -3,22 +3,45 @@
 #include "guitar_pro.h"
 #include "reaper.h"
 
-#include <array>
+#include <algorithm>
 #include <chrono>
 #include <memory>
 #include <stdexcept>
 
 namespace tnt {
 
-// REAPER runs this periodically 30 times/second so a desync window of 3 is approximately 100ms
-static constexpr int DESYNC_WINDOW_SIZE = 3;
-
-static constexpr double DESYNC_THRESHOLD = 0.06;                // Seconds
+// REAPER runs this periodically 30 times/second.
 static constexpr double MINIMUM_TIME_STEP = 0.001;              // Seconds
 static constexpr double MINIMUM_PLAY_RATE_STEP = 0.001;         // Seconds
 static constexpr double GUITAR_PRO_CURSOR_JUMP_THRESHOLD = 0.1; // Seconds
+static constexpr double LOOP_BOUNDARY_TOLERANCE = 0.06;         // Seconds; don't touch anything this close to a loop edge
 // Cap dead reckoning extrapolation to avoid runaway drift between Guitar Pro updates.
 static constexpr double DEAD_RECKONING_MAX_EXTRAPOLATION = 0.2; // Seconds
+
+// Position servo: instead of waiting for drift to accumulate and then jumping REAPER's
+// cursor (which leaves a window where the notation is visibly out of sync with the audio
+// before the jump happens), continuously nudge REAPER's play rate a tiny, inaudible amount
+// toward Guitar Pro's position every tick. This keeps the drift from ever growing large
+// enough to be noticeable, instead of correcting it after the fact.
+static constexpr double POSITION_SERVO_MAX_RATE_NUDGE = 0.004;     // max +-0.4% deviation from nominal tempo
+static constexpr double POSITION_SERVO_JUMP_THRESHOLD  = 0.25;     // Seconds; beyond this, drift is treated as a
+                                                                    // real discontinuity (stall/glitch) - jump instead
+// Error at which the nudge saturates at POSITION_SERVO_MAX_RATE_NUDGE. Keep this well below
+// POSITION_SERVO_JUMP_THRESHOLD so typical small drift gets a strong, fast correction instead
+// of a barely-there one, without hammering REAPER's preserve-pitch time stretch by re-issuing
+// the rate too often/aggressively (0.03s was tried and caused audible artifacts).
+static constexpr double POSITION_SERVO_SATURATION_ERROR = 0.09;   // Seconds
+static constexpr double POSITION_SERVO_GAIN = POSITION_SERVO_MAX_RATE_NUDGE / POSITION_SERVO_SATURATION_ERROR;
+// Only re-issue SetPlayRate when the target moved by at least this much, so the time
+// stretch engine isn't asked to recompute on every single tick for negligible changes.
+static constexpr double POSITION_SERVO_UPDATE_STEP = 0.0015;
+
+// Small hardcoded bias to compensate a residual lag that may show up consistently, rather
+// than varying take to take like normal drift — a fixed lead is the right tool for that
+// (the servo/dead-reckoning only correct relative drift, not a constant offset). This value
+// was tuned by ear for GoPlayAlong on a specific machine/audio setup — re-tune it here from
+// scratch (start at 0.0) rather than trusting the ported number.
+static constexpr double EXTRA_LEAD_COMPENSATION = 0.0;   // Seconds
 
 struct Plugin::Impl final {
     Impl(PluginState& plugin_state)
@@ -81,13 +104,11 @@ struct Plugin::Impl final {
                 this->SetPlayPosition(m_guitar_pro_state.play_position);
             }
 
-            // Sync play rate
-            if (this->GuitarProPlayRateChanged())
-            {
-                // TODO this doesn't work while paused because the value read from memory only updates at runtime.
-                // We need to find a new memory address to get this to work more effectively
-                this->SyncPlayRate();
-            }
+            // Sync play rate. SyncPlayRate() gates internally on GuitarProPlayRateChanged()
+            // (see its definition), so this can be called unconditionally.
+            // TODO this doesn't work while paused because the value read from memory only updates at runtime.
+            // We need to find a new memory address to get this to work more effectively
+            this->SyncPlayRate();
         }
 
         // Ensure REAPER is playing if Guitar Pro is playing
@@ -100,8 +121,8 @@ struct Plugin::Impl final {
 private:
     // Dead reckoning: track the last Guitar Pro position update and extrapolate forward
     // using elapsed real time x play rate. This gives a smooth real-time estimate of
-    // Guitar Pro's current position between its ~15 Hz memory updates, allowing a much
-    // tighter DESYNC_THRESHOLD without triggering false corrections from stale data.
+    // Guitar Pro's current position between its ~15 Hz memory updates, so the position
+    // servo has a stable error signal to correct against instead of stale/jumpy data.
     void UpdateDeadReckoning()
     {
         if (!this->CompareDoubles(m_guitar_pro_state.play_position, m_gp_reckoned_position, MINIMUM_TIME_STEP))
@@ -145,47 +166,74 @@ private:
     void SyncPlayPosition()
     {
         const double gp_pos = this->GetDeadReckonedPosition();
+        const double reaper_pos = m_reaper.GetPlayPosition();
 
-        if (!this->CompareDoubles(m_reaper.GetPlayPosition(), gp_pos, DESYNC_THRESHOLD))
+        // Do not touch anything right at a loop boundary — let Guitar Pro's own loop
+        // reset settle first, and drop any lingering rate nudge so it doesn't carry over.
+        if (this->CompareDoubles(reaper_pos, m_guitar_pro_state.time_selection_start_position, LOOP_BOUNDARY_TOLERANCE)
+         || this->CompareDoubles(reaper_pos, m_guitar_pro_state.time_selection_end_position, LOOP_BOUNDARY_TOLERANCE))
         {
-            // DO NOT SYNC if REAPER is right at the start or end of the loop
-            if (this->CompareDoubles(m_reaper.GetPlayPosition(), m_guitar_pro_state.time_selection_start_position, DESYNC_THRESHOLD)
-             || this->CompareDoubles(m_reaper.GetPlayPosition(), m_guitar_pro_state.time_selection_end_position, DESYNC_THRESHOLD))
-            {
-                return;
-            }
+            this->ResetPlayRateToNominal();
+            return;
+        }
 
-            // If the guitar pro cursor has jumped, follow the jump
-            if (!this->CompareDoubles(m_prev_guitar_pro_state.play_position, m_guitar_pro_state.play_position, GUITAR_PRO_CURSOR_JUMP_THRESHOLD))
-            {
-                this->SetPlayPosition(gp_pos + m_reaper.GetOutputLatency());
-            }
+        // Follow intentional seeks in Guitar Pro immediately — a servo nudge would take
+        // too long to catch up to a deliberate jump, so just cut over.
+        if (!this->CompareDoubles(m_prev_guitar_pro_state.play_position, m_guitar_pro_state.play_position, GUITAR_PRO_CURSOR_JUMP_THRESHOLD))
+        {
+            this->SetPlayPosition(gp_pos + m_reaper.GetOutputLatency() + EXTRA_LEAD_COMPENSATION);
+            return;
+        }
 
-            // If a desync occurs for any other reason, get it back in sync
-            else if (this->Desync(DESYNC_THRESHOLD, gp_pos))
-            {
-                this->SetPlayPosition(gp_pos + m_reaper.GetOutputLatency());
-            }
+        const double error = (gp_pos + m_reaper.GetOutputLatency() + EXTRA_LEAD_COMPENSATION) - reaper_pos;
+
+        if (fabs(error) > POSITION_SERVO_JUMP_THRESHOLD)
+        {
+            // Drift got too large for a smooth correction (e.g. a stall or a glitched
+            // read) — fall back to a hard jump rather than nudging for a long time.
+            this->SetPlayPosition(gp_pos + m_reaper.GetOutputLatency() + EXTRA_LEAD_COMPENSATION);
+            return;
+        }
+
+        this->EnablePreservePitch();
+
+        const double correction = std::clamp(error * POSITION_SERVO_GAIN, -POSITION_SERVO_MAX_RATE_NUDGE, POSITION_SERVO_MAX_RATE_NUDGE);
+        const double target_rate = m_guitar_pro_state.play_rate * (1.0 + correction);
+
+        if (!this->CompareDoubles(m_reaper.GetPlayRate(), target_rate, POSITION_SERVO_UPDATE_STEP))
+        {
+            m_reaper.SetPlayRate(target_rate);
         }
     }
 
+    // Cancels any active servo rate nudge, returning REAPER to Guitar Pro's exact nominal tempo.
+    void ResetPlayRateToNominal()
+    {
+        if (m_guitar_pro_state.play_rate > MINIMUM_PLAY_RATE_STEP
+         && !this->CompareDoubles(m_reaper.GetPlayRate(), m_guitar_pro_state.play_rate, MINIMUM_PLAY_RATE_STEP))
+        {
+            m_reaper.SetPlayRate(m_guitar_pro_state.play_rate);
+        }
+    }
+
+    // Handles deliberate tempo changes in Guitar Pro. Gated on GuitarProPlayRateChanged()
+    // rather than comparing against REAPER's live rate, since the position servo
+    // intentionally keeps REAPER's live rate slightly off the nominal tempo — comparing
+    // directly would fight the servo and pause playback every tick.
+    //
+    // TODO: The running playback rate memory location seems to take a bit to update when playing the song
+    // Because of this, the playback rate may register as 0 for a fraction of a second.
+    // Look for a better address in Cheat Engine so this can be done faster
     void SyncPlayRate()
     {
-        // TODO: The running playback rate memory location seems to take a bit to update when playing the song
-        // Because of this, the playback rate may register as 0 for a fraction of a second.
-        // Look for a better address in Cheat Engine so this can be done faster
-        if (m_guitar_pro_state.play_rate > MINIMUM_PLAY_RATE_STEP)
+        if (m_guitar_pro_state.play_rate > MINIMUM_PLAY_RATE_STEP && this->GuitarProPlayRateChanged())
         {
-            // If playback rates don't match, sync them
-            if (!this->CompareDoubles(m_reaper.GetPlayRate(), m_guitar_pro_state.play_rate, MINIMUM_PLAY_RATE_STEP))
-            {
-                // Always ensure preserve pitch is set before stretching
-                this->EnablePreservePitch();
+            // Always ensure preserve pitch is set before stretching
+            this->EnablePreservePitch();
 
-                // REAPER handles stretching much more efficiently if the song is paused
-                m_reaper.SetPlayState(ReaperPlayState::PAUSED);
-                m_reaper.SetPlayRate(m_guitar_pro_state.play_rate);
-            }
+            // REAPER handles stretching much more efficiently if the song is paused
+            m_reaper.SetPlayState(ReaperPlayState::PAUSED);
+            m_reaper.SetPlayRate(m_guitar_pro_state.play_rate);
         }
     }
 
@@ -212,12 +260,12 @@ private:
                 // If a loop is specified start there
                 if (m_guitar_pro_state.time_selection_start_position > MINIMUM_TIME_STEP)
                 {
-                    this->SetPlayPosition(m_guitar_pro_state.time_selection_start_position + m_reaper.GetOutputLatency());
+                    this->SetPlayPosition(m_guitar_pro_state.time_selection_start_position + m_reaper.GetOutputLatency() + EXTRA_LEAD_COMPENSATION);
                 }
 
                 else
                 {
-                    this->SetPlayPosition(m_guitar_pro_state.play_position + m_reaper.GetOutputLatency());
+                    this->SetPlayPosition(m_guitar_pro_state.play_position + m_reaper.GetOutputLatency() + EXTRA_LEAD_COMPENSATION);
                 }
 
                 m_reaper.SetPlayState(ReaperPlayState::PLAYING);
@@ -229,8 +277,8 @@ private:
         {
             // DO NOT cut a time selection short
             if (m_reaper.GetPlayPosition() < m_guitar_pro_state.time_selection_end_position
-             && this->CompareDoubles(m_reaper.GetPlayPosition(), m_guitar_pro_state.time_selection_end_position, DESYNC_THRESHOLD)
-             && !this->CompareDoubles(m_reaper.GetPlayPosition(), m_guitar_pro_state.time_selection_start_position, DESYNC_THRESHOLD))
+             && this->CompareDoubles(m_reaper.GetPlayPosition(), m_guitar_pro_state.time_selection_end_position, LOOP_BOUNDARY_TOLERANCE)
+             && !this->CompareDoubles(m_reaper.GetPlayPosition(), m_guitar_pro_state.time_selection_start_position, LOOP_BOUNDARY_TOLERANCE))
             {
                 m_guitar_pro_state.play_state = true;
                 return;
@@ -240,28 +288,9 @@ private:
         }
     }
 
-    bool Desync(const double threshold, const double reference_position)
-    {
-        std::rotate(m_desync_window.rbegin(), m_desync_window.rbegin() + 1, m_desync_window.rend());
-        m_desync_window[0] = fabs(m_reaper.GetPlayPosition() - reference_position);
-
-        // Return false if ANY value in the window is not greater than the threshold
-        for (const double value : m_desync_window)
-        {
-            if (value < threshold)
-            {
-                return false;
-            }
-        }
-
-        // Desync has definitively occurred
-        return true;
-    }
-
     void SetPlayPosition(const double time)
     {
         m_reaper.SetEditCursorPosition(time, false, true);
-        m_desync_window.fill(0.0);
     }
 
     // Returns true if the two values are within epsilon of each other
@@ -320,8 +349,6 @@ private:
 
     GuitarProState m_prev_guitar_pro_state;
     GuitarProState m_guitar_pro_state;
-
-    std::array<double, DESYNC_WINDOW_SIZE> m_desync_window = { 0.0 };
 
     // Keeps track of the last error (prevents spamming the log with errors)
     std::string m_last_error = "";
